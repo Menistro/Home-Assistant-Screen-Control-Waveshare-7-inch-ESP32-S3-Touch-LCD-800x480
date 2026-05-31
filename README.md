@@ -31,6 +31,13 @@ This isn't just a visual layout; it includes advanced C++ and YAML logic to solv
 * **USB-C cable:** To connect the screen to the power supply.
 * **Screen mount:** 3D printed case [Waveshare ESP32-S3 7inch Capacitive Touch Display wall mount case by Sergey Morozov](https://www.printables.com/model/1030369-waveshare-esp32-s3-7inch-capacitive-touch-display)
 
+## 🔌 Hardware Modifications (PWM Brightness)
+Out of the box, the Waveshare 7" board only supports simple ON/OFF backlight control via the CH422G I2C expander. To enable the buttery-smooth, zero-latency dimming featured in this dashboard, a hardware modification is required to route **GPIO16** directly for PWM control. 
+
+The underlying hardware mapping and modification strategy for the touchpad and brightness control was sourced from [inytar's esphome repository](https://github.com/inytar/waveshare-esp32-s3-touch-lcd-7-esphome).
+
+<img width="2048" height="1536" alt="Dash-preview" src="https://github.com/inytar/waveshare-esp32-s3-touch-lcd-7-esphome/blob/main/brightness_solder.jpg" />
+
 ## 🚀 Installation & Setup
 
 1. **Copy the YAML:** Copy the contents of `waveshare-panel-ha-simple-dash.yaml` into a new ESPHome node.
