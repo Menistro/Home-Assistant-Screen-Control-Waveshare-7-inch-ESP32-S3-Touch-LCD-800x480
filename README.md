@@ -5,7 +5,7 @@ Custom ESPHome firmware to transform a Waveshare 7-inch ESP32-S3 touch panel int
 
 A highly optimized, dark-mode smart home dashboard for the **Waveshare 7-inch ESP32-S3 Touch LCD (800x480)**. Built completely in ESPHome using the LVGL graphics engine, this configuration provides a premium, lag-free interface to control Home Assistant entities.
 
-![Dashboard Preview](assets/preview.jpg) *(Note: Upload a photo of your screen and place it in an 'assets' folder!)*
+![Dashboard Preview](assets/Waveshare-screen-on.jpg)
 
 ## ⚠️ Disclaimer regarding Support and Issues
 **Please note:** This entire configuration was created with the assistance of **Gemini 3.1 Pro**, as I do not have extensive personal knowledge or background in ESPHome C++ coding. 
