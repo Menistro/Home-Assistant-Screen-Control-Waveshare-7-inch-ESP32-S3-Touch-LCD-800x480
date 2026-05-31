@@ -1,0 +1,2 @@
+# Home-Assistant-Screen-Control-Waveshare-7-inch-ESP32-S3-Touch-LCD-800x480
+Custom ESPHome firmware to transform a Waveshare 7-inch ESP32-S3 touch panel into a Home Assistant dashboard. It features a dark-mode LVGL UI controlling four lighting zones via synced sliders. Advanced logic includes zero-latency screen dimming, auto-sleep power management, and network debouncing for flawless two-way synchronization.
