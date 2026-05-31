@@ -5,7 +5,7 @@ Custom ESPHome firmware to transform a Waveshare 7-inch ESP32-S3 touch panel int
 
 A highly optimized, dark-mode smart home dashboard for the **Waveshare 7-inch ESP32-S3 Touch LCD (800x480)**. Built completely in ESPHome using the LVGL graphics engine, this configuration provides a premium, lag-free interface to control Home Assistant entities.
 
-![Dashboard Preview](assets/Waveshare-screen-on.jpg)
+![Dashboard Preview](assets/Waveshare-screen-on.jpeg)
 
 ## ⚠️ Disclaimer regarding Support and Issues
 **Please note:** This entire configuration was created with the assistance of **Gemini 3.1 Pro**, as I do not have extensive personal knowledge or background in ESPHome C++ coding. 
@@ -26,16 +26,20 @@ This isn't just a visual layout; it includes advanced C++ and YAML logic to solv
 
 ## 🛠️ Hardware Requirements
 
-* **Board:** [Waveshare ESP32-S3-Touch-LCD-7](https://www.waveshare.com/esp32-s3-touch-lcd-7.htm) (800x480 resolution)
+* **Board:** [Waveshare ESP32-S3-Touch-LCD-7](https://www.waveshare.com/esp32-s3-touch-lcd-7.htm) (800x480 resolution).
 * **Power:** A high-quality USB-C power supply (the screen and ESP32-S3 draw significant current when at 100% brightness).
+* **USB-C cable:** To connect the screen to the power supply.
+* **Screen mount:** 3D printed case [Waveshare ESP32-S3 7inch Capacitive Touch Display wall mount case by Sergey Morozov](https://www.printables.com/model/1030369-waveshare-esp32-s3-7inch-capacitive-touch-display)
 
 ## 🚀 Installation & Setup
 
-1. **Copy the YAML:** Copy the contents of `waveshare-panel.yaml` into a new ESPHome node.
+1. **Copy the YAML:** Copy the contents of `waveshare-panel-ha-simple-dash.yaml` into a new ESPHome node.
 2. **Update Secrets:** Ensure your Wi-Fi credentials are set correctly (`!secret wifi_ssid`, etc.).
 3. **Map Your Entities:** Do a standard `CTRL+F` (Find and Replace) to swap out my placeholder lights (e.g., `light.led_strip_kitchen_sink`) with your actual Home Assistant entity IDs.
 4. **Compile & Upload:** The first compile will take a few minutes as ESPHome downloads the LVGL library and fetches the Material Design Icons directly from Google's Font API.
 5. **Enjoy:** Once flashed, the screen will boot up, turn on the LCD circuit via the I2C expander, and instantly sync with your Home Assistant states!
+
+To allow easy connection to the Wifi, I have set the ESP32 as a new empty device in **ESPHome Device Builder** from Home Assistant and afterwards the code. I have set an static IP not only in the MCU but as well in the router.
 
 ## 🖌️ Fonts & Icons
 This project uses the official Google Roboto font and Material Design Icons. You do not need to download them manually; the ESPHome `font:` block is configured to fetch the exact glyphs via the Google Fonts API during compilation.
