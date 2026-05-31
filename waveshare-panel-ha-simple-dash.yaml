@@ -1,0 +1,997 @@
+# ==============================================================================
+# 1. CORE SYSTEM & HARDWARE DEFINITION
+# ==============================================================================
+# This section defines the brains of the operation: the ESP32-S3 chip. 
+# It sets up the framework, memory limits, and initial boot priorities.
+esphome:
+  name: waveshare-panel
+  friendly_name: waveshare-panel
+  min_version: "2025.8.0"
+  platformio_options:
+    board_upload.maximum_ram_size: 524288
+  on_boot:
+    # priority: -100 ensures this runs late in the boot sequence when everything is ready
+    priority: -100
+    then:
+      # Physically turn on the LCD power circuit
+      - light.turn_on: lcd_circuit_power
+      # Start listening for touches immediately
+      - script.execute: handle_touch
+
+# High-resolution graphics require immense memory. This activates the 8MB of 
+# Octal PSRAM on the Waveshare board to give the LVGL engine room to breathe.
+psram:
+  mode: octal
+  speed: 80MHz
+
+esp32:
+  variant: esp32s3
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    advanced:
+      enable_idf_experimental_features: true
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: "ADD HERE YOUR ENCRYPTION KEY"
+
+ota:
+  - platform: esphome
+    password: "ADD YOUR OTA PASSWORD HERE"
+
+wifi:
+  ssid: ADD YOUR WIFI SSID HERE
+  password: ADD YOUR WIFI PASSWORD HERE
+  manual_ip:
+    static_ip: 0.0.0.0
+    gateway: 0.0.0.0
+    subnet: 0.0.0.0
+
+# ==============================================================================
+# 2. TYPOGRAPHY & ICONS
+# ==============================================================================
+# ESPHome downloads these directly from Google's servers during compilation 
+# and embeds them into the firmware, saving massive amounts of flash storage.
+font:
+  - file: "gfonts://Material Icons"
+    id: icon_font
+    size: 24
+    glyphs:
+      - "\uE518"  # The Full Sun Icon (Used for brightness)
+      - "\uE1FF"  # The True Thermometer Icon (Used for color temperature)
+
+  - file: "gfonts://Roboto"
+    id: text_font
+    size: 18
+
+# ==============================================================================
+# 3. LOW-LEVEL HARDWARE MAPPING (I2C & EXPANDER)
+# ==============================================================================
+# The ESP32-S3 doesn't have enough pins to drive the screen alone. Waveshare 
+# uses a CH422G chip to expand the GPIO pins over an I2C connection.
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  id: bus_a
+
+ch422g:
+  - id: ch422g_hub
+
+# ==============================================================================
+# 4. GLOBAL VARIABLES (THE BRAINS OF THE LOGIC)
+# ==============================================================================
+globals:
+  # Tracks the physical state of the display:
+  # 0 = Fully Awake (100% Brightness)
+  # 1 = Dimmed (15% Brightness)
+  # 2 = Deep Sleep (0% Brightness, Touch UI Paused)
+  - id: screen_state
+    type: int
+    restore_value: false
+    initial_value: '0'
+    
+  # The master "Sync Lock". When true, the screen ignores its own slider movements 
+  # so it doesn't accidentally bounce a command back to Home Assistant.
+  - id: ui_lock
+    type: bool
+    initial_value: 'false'
+
+substitutions:
+  backlight_brightness_pin: "GPIO16"
+  initial_brightness: "0.8"
+  min_power: "0.07"
+
+# ==============================================================================
+# 5. PHYSICAL OUTPUTS
+# ==============================================================================
+output:
+  # Controls the main power line to the screen via the CH422G expander
+  - platform: gpio
+    id: lcdbacklight_output
+    pin:
+      ch422g: ch422g_hub
+      number: 2
+      mode:
+        output: true
+      inverted: false
+
+  # Controls the physical screen brightness via hardware PWM for zero-latency dimming
+  - platform: ledc
+    pin: ${backlight_brightness_pin}
+    id: backlight_brightness_output
+    min_power: ${min_power}
+    zero_means_zero: true
+
+light:
+  - platform: binary
+    output: lcdbacklight_output
+    id: lcd_circuit_power
+    internal: true
+    restore_mode: ALWAYS_ON
+
+  - platform: monochromatic
+    output: backlight_brightness_output
+    id: lcdbacklight_brightness
+    name: "LCD Backlight"
+    icon: mdi:wall-sconce-flat-outline
+    restore_mode: ALWAYS_ON
+    initial_state:
+      brightness: ${initial_brightness}
+
+# ==============================================================================
+# 6. AUTOMATION SCRIPTS
+# ==============================================================================
+script:
+  # Triggered physically by the touchscreen component below.
+  - id: handle_touch
+    mode: restart
+    then:
+      # If the screen is currently dim or asleep...
+      - if:
+          condition:
+            lambda: 'return id(screen_state) != 0;'
+          then:
+            # Wake it up to full brightness
+            - light.turn_on:
+                id: lcdbacklight_brightness
+                brightness: 1.0
+            # If it was in deep sleep, the graphics engine was frozen to save CPU.
+            # We must explicitly unpause the graphics engine here.
+            - if:
+                condition:
+                  lambda: 'return id(screen_state) == 2;'
+                then:
+                  - lvgl.resume:
+            # Mark the state as fully awake
+            - globals.set:
+                id: screen_state
+                value: '0'
+      # Restart the countdown timer so the screen stays awake while you use it
+      - script.execute: screen_timeout_timer
+  
+  # NETWORK DEBOUNCER 1: Brightness
+  # Intercepts slider movements, waits 250ms for you to stop dragging, and then
+  # sends ONE clean packet to Home Assistant to prevent crashing the ESP32 Wi-Fi stack.
+  - id: send_brightness
+    mode: restart
+    parameters:
+      entity_name: string
+      bri_val: int
+    then:
+      - delay: 250ms  
+      - homeassistant.service:
+          service: light.turn_on
+          variables:
+            target: 'return entity_name;'
+            val: 'return bri_val;'
+          data_template:
+            entity_id: "{{ target }}"
+            brightness_pct: "{{ val }}"
+
+  # NETWORK DEBOUNCER 2: Color Temperature
+  - id: send_temp
+    mode: restart
+    parameters:
+      entity_name: string
+      temp_val: int
+    then:
+      - delay: 250ms 
+      - homeassistant.service:
+          service: light.turn_on
+          variables:
+            target: 'return entity_name;'
+            val: 'return temp_val;'
+          data_template:
+            entity_id: "{{ target }}"
+            color_temp_kelvin: "{{ val }}"
+
+  # The Power Management State Machine
+  - id: screen_timeout_timer
+    mode: restart
+    then:
+      # Wait 1 minute of complete inactivity, then dim the screen
+      - delay: 1min
+      - light.turn_on:
+          id: lcdbacklight_brightness
+          brightness: 0.15 
+      - globals.set:
+          id: screen_state
+          value: '1'
+      
+      # Wait 4 more minutes (5 total), turn off completely, and freeze the UI engine
+      - delay: 4min
+      - light.turn_off: lcdbacklight_brightness 
+      - lvgl.pause:                             
+      - globals.set:
+          id: screen_state
+          value: '2'
+
+# ==============================================================================
+# 7. DISPLAY & TOUCH PROTOCOLS
+# ==============================================================================
+display:
+  - platform: mipi_rgb
+    model: ESP32-S3-TOUCH-LCD-7-800X480
+    id: waveshare_display
+    update_interval: never
+    auto_clear_enabled: false
+    color_order: RGB
+    pclk_frequency: 14MHZ
+    dimensions:
+      width: 800
+      height: 480
+    de_pin:
+      number: 5
+    hsync_pin:
+      number: 46
+      ignore_strapping_warning: true
+    vsync_pin:
+      number: 3
+      ignore_strapping_warning: true
+    pclk_pin: 7
+    pclk_inverted: true
+    reset_pin:
+      ch422g: ch422g_hub
+      number: 3
+    hsync_back_porch: 8
+    hsync_front_porch: 8
+    hsync_pulse_width: 4
+    vsync_back_porch: 16
+    vsync_front_porch: 16
+    vsync_pulse_width: 4
+    data_pins:
+      red: [1, 2, 42, 41, 40]
+      blue: [14, 38, 18, 17, 10]
+      green: [39, 0, 45, 48, 47, 21]
+
+touchscreen:
+  platform: gt911
+  id: waveshare_touch
+  interrupt_pin: GPIO4
+  reset_pin:
+    ch422g: ch422g_hub
+    number: 1
+    mode: OUTPUT
+  # Every time the screen is physically touched, fire the wake-up script
+  on_touch:
+    - script.execute: handle_touch
+
+
+# ==============================================================================
+# 8. LVGL USER INTERFACE (THE VISUAL DASHBOARD)
+# ==============================================================================
+lvgl:
+  page_wrap: false 
+  bg_color: 0x121212  # Base layer is pitch black to match dark mode aesthetics
+  
+  widgets:
+    # --------------------------------------------------------------------------
+    # CARD 1: SINK LIGHTS (Top Left)
+    # --------------------------------------------------------------------------
+    - obj:
+        x: 20
+        y: 20
+        width: 380
+        height: 170
+        bg_color: 0x1E1E1E  # Container is a slightly lighter grey to create depth
+        radius: 16          # Modern pill-style rounding
+        border_width: 0
+        
+        widgets:
+          - label:
+              text: "Sink Lights"
+              text_font: text_font
+              x: 15
+              y: 15
+              text_color: 0xFFFFFF
+
+          - switch:
+              id: sink_switch
+              align: top_right
+              x: -15
+              y: 10
+              on_value:
+                # DUAL-RULE LOGIC: Prevents C++ compilation bugs by explicitly defining
+                # what happens when 'x' is true (ON) vs 'x' is false (OFF).
+                # Also checks '!id(ui_lock)' to ensure it doesn't fire when HA updates it.
+                - if:
+                    condition:
+                      lambda: 'return x && !id(ui_lock);' 
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_on
+                          data:
+                            entity_id: light.led_strip_kitchen_sink
+                - if:
+                    condition:
+                      lambda: 'return !x && !id(ui_lock);'
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_off
+                          data:
+                            entity_id: light.led_strip_kitchen_sink
+
+          - label:
+              text: "\uE518"
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 61
+          - slider:
+              id: sink_bri_slider
+              x: 45
+              y: 70
+              width: 280
+              height: 10
+              min_value: 1
+              max_value: 100
+              value: 50
+              # Track styling to make the empty limits visible against dark backgrounds
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              on_value:
+                # If physical touch (!id(ui_lock)), fire the Debouncer script
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);'  
+                    then:
+                      - script.execute:               
+                          id: send_brightness
+                          entity_name: "light.led_strip_kitchen_sink"
+                          bri_val: !lambda "return x;"
+
+          - label:
+              text: "\uE1FF"
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 106
+          - slider:
+              id: sink_temp_slider
+              x: 45
+              y: 115
+              width: 280
+              height: 10
+              min_value: 2700  
+              max_value: 6500  
+              value: 4000
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              indicator:
+                # Defines a horizontal gradient that visually shifts from Amber to Blue
+                bg_color: 0xFF9800         
+                bg_grad_color: 0x29B6F6    
+                bg_grad_dir: HOR           
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);' 
+                    then:
+                      - script.execute:               
+                          id: send_temp
+                          entity_name: "light.led_strip_kitchen_sink"
+                          temp_val: !lambda "return x;"
+
+    # --------------------------------------------------------------------------
+    # CARD 2: DRYING RACK LIGHTS (Top Right)
+    # --------------------------------------------------------------------------
+    - obj:
+        x: 410
+        y: 20
+        width: 380
+        height: 170
+        bg_color: 0x1E1E1E  
+        radius: 16          
+        border_width: 0
+        
+        widgets:
+          - label:
+              text: "Drying Rack Lights"
+              text_font: text_font
+              x: 15
+              y: 15
+              text_color: 0xFFFFFF
+    
+          - switch:
+              id: rack_switch
+              align: top_right
+              x: -15
+              y: 10
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return x && !id(ui_lock);' 
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_on
+                          data:
+                            entity_id: light.led_strip_over_drying_rack
+                - if:
+                    condition:
+                      lambda: 'return x && !id(ui_lock);'
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_off
+                          data:
+                            entity_id: light.led_strip_over_drying_rack
+                            
+          - label:
+              text: "\uE518" 
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 61
+          - slider:
+              id: rack_bri_slider
+              x: 45
+              y: 70
+              width: 280
+              height: 10
+              min_value: 1
+              max_value: 100
+              value: 50
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);'  
+                    then:
+                      - script.execute:               
+                          id: send_brightness
+                          entity_name: "light.led_strip_over_drying_rack"
+                          bri_val: !lambda "return x;"
+
+          - label:
+              text: "\uE1FF"  
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 106
+          - slider:
+              id: rack_temp_slider
+              x: 45
+              y: 106
+              width: 280
+              height: 10
+              min_value: 2700  
+              max_value: 6500  
+              value: 4000
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              indicator:
+                bg_color: 0xFF9800         
+                bg_grad_color: 0x29B6F6    
+                bg_grad_dir: HOR           
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);' 
+                    then:
+                      - script.execute:               
+                          id: send_temp
+                          entity_name: "light.led_strip_over_drying_rack"
+                          temp_val: !lambda "return x;"
+
+    # --------------------------------------------------------------------------
+    # CARD 3: COFFEE MACHINE LIGHTS (Bottom Left)
+    # --------------------------------------------------------------------------
+    - obj:
+        x: 20
+        y: 200
+        width: 380
+        height: 170
+        bg_color: 0x1E1E1E  
+        radius: 16          
+        border_width: 0
+        
+        widgets:
+          - label:
+              text: "Coffee Machine Lights"
+              text_font: text_font
+              x: 15
+              y: 15
+              text_color: 0xFFFFFF
+
+          - switch:
+              id: coffee_switch
+              align: top_right
+              x: -15
+              y: 10
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return x && !id(ui_lock);'  
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_on
+                          data:
+                            entity_id: light.led_strip_kitchen_coffee_machine
+                - if:
+                    condition:
+                      lambda: 'return !x && !id(ui_lock);'
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_off
+                          data:
+                            entity_id: light.led_strip_kitchen_coffee_machine
+
+          - label:
+              text: "\uE518"  
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 61
+          - slider:
+              id: coffee_bri_slider
+              x: 45
+              y: 70
+              width: 280
+              height: 10
+              min_value: 1
+              max_value: 100
+              value: 50
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);' 
+                    then:
+                      - script.execute:               
+                          id: send_brightness
+                          entity_name: "light.led_strip_kitchen_coffee_machine"
+                          bri_val: !lambda "return x;"
+
+          - label:
+              text: "\uE1FF" 
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 106
+          - slider:
+              id: coffee_temp_slider
+              x: 45
+              y: 106
+              width: 280
+              height: 10
+              min_value: 2700  
+              max_value: 6500  
+              value: 4000
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              indicator:
+                bg_color: 0xFF9800         
+                bg_grad_color: 0x29B6F6    
+                bg_grad_dir: HOR           
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);'  
+                    then:
+                      - script.execute:               
+                          id: send_temp
+                          entity_name: "light.led_strip_kitchen_coffee_machine"
+                          temp_val: !lambda "return x;"
+
+    # --------------------------------------------------------------------------
+    # CARD 4: TV LED LIGHTS (Bottom Right)
+    # --------------------------------------------------------------------------
+    - obj:
+        x: 410
+        y: 200
+        width: 380
+        height: 170
+        bg_color: 0x1E1E1E  
+        radius: 16          
+        border_width: 0
+        
+        widgets:
+          - label:
+              text: "TV Shelves Lights"
+              text_font: text_font
+              x: 15
+              y: 15
+              text_color: 0xFFFFFF
+
+          - switch:
+              id: tv_switch
+              align: top_right
+              x: -15
+              y: 10
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return x && !id(ui_lock);'  
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_on
+                          data:
+                            entity_id: light.led_strip_shelves_above_tv
+                - if:
+                    condition:
+                      lambda: 'return !x && !id(ui_lock);'
+                    then:
+                      - homeassistant.service:
+                          service: light.turn_off
+                          data:
+                            entity_id: light.led_strip_shelves_above_tv
+          
+          - label:
+              text: "\uE518"  
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 61
+          - slider:
+              id: tv_bri_slider
+              x: 45
+              y: 70
+              width: 280
+              height: 10
+              min_value: 1
+              max_value: 100
+              value: 50
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);'  
+                    then:
+                      - script.execute:               
+                          id: send_brightness
+                          entity_name: "light.led_strip_shelves_above_tv"
+                          bri_val: !lambda "return x;"
+              
+          - label:
+              text: "\uE1FF" 
+              text_font: icon_font
+              text_color: 0xAAAAAA
+              x: 10
+              y: 106
+          - slider:
+              id: tv_temp_slider
+              x: 45
+              y: 115
+              width: 280
+              height: 10
+              min_value: 2700  
+              max_value: 6500  
+              value: 4000
+              bg_color: 0x4A4A4A
+              border_width: 1
+              border_color: 0x777777
+              radius: 8
+              indicator:
+                bg_color: 0xFF9800         
+                bg_grad_color: 0x29B6F6   
+                bg_grad_dir: HOR           
+              on_value:
+                - if:
+                    condition:
+                      lambda: 'return !id(ui_lock);'  
+                    then:
+                      - script.execute:               
+                          id: send_temp
+                          entity_name: "light.led_strip_shelves_above_tv"
+                          temp_val: !lambda "return x;"
+
+    # --------------------------------------------------------------------------
+    # MASTER HARDWARE CONTROL: Bottom Screen Backlight Slider
+    # --------------------------------------------------------------------------
+    # This slider floats entirely outside the cards. It bypasses Home Assistant
+    # and talks DIRECTLY to the ESP32's PWM output for zero-latency screen dimming.
+    - label:
+        text: "\uE518"
+        text_font: icon_font
+        text_color: 0xAAAAAA
+        x: 110
+        y: 410
+
+    - slider:
+        id: backlight_slider
+        x: 165
+        y: 415
+        width: 460
+        height: 15
+        min_value: 15   
+        max_value: 100
+        value: 100      
+        bg_color: 0x4A4A4A       
+        border_width: 1          
+        border_color: 0x777777   
+        radius: 8                
+        on_value:
+          - output.set_level:
+              id: backlight_brightness_output
+              level: !lambda "return x / 100.0;"
+
+  displays:
+    - waveshare_display
+
+# ==============================================================================
+# 9. HOME ASSISTANT TWO-WAY SYNC RECEIVERS
+# ==============================================================================
+# This section listens for external state changes (e.g., someone uses the HA App).
+# It enforces the "Sync Lock Sandwich" logic to update the UI without echoing.
+
+binary_sensor:
+  # --- SINK SWITCH SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_kitchen_sink
+    id: ha_sink_state
+    on_state:
+        # STEP 1: Lock the UI so the screen knows HA is driving
+        - globals.set:           
+            id: ui_lock
+            value: 'true'
+        # STEP 2: Update the physical graphics
+        - lvgl.switch.update:
+            id: sink_switch
+            state:
+              checked: !lambda "return x;"
+        # STEP 3: Unlock the UI so the user can touch it again
+        - globals.set:           
+            id: ui_lock
+            value: 'false'
+
+  # --- DRYING RACK SWITCH SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_over_drying_rack
+    id: ha_rack_state
+    on_state:
+      - globals.set:           
+          id: ui_lock
+          value: 'true'
+      - lvgl.switch.update:
+          id: rack_switch
+          state:
+            checked: !lambda "return x;"
+      - globals.set:           
+          id: ui_lock
+          value: 'false'
+
+  # --- COFFEE MACHINE SWITCH SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_kitchen_coffee_machine
+    id: ha_coffee_state
+    on_state:
+      - globals.set:           
+          id: ui_lock
+          value: 'true'
+      - lvgl.switch.update:
+          id: coffee_switch
+          state:
+            checked: !lambda "return x;"
+      - globals.set:           
+          id: ui_lock
+          value: 'false'
+
+  # --- TV SHELVES SWITCH SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_shelves_above_tv
+    id: ha_tv_state
+    on_state:
+      - globals.set:           
+          id: ui_lock
+          value: 'true'
+      - lvgl.switch.update:
+          id: tv_switch
+          state:
+            checked: !lambda "return x;"
+      - globals.set:           
+          id: ui_lock
+          value: 'false'
+
+sensor:
+  # ==========================================
+  # BRIGHTNESS SYNC SENSORS
+  # ==========================================
+  # Converts Home Assistant's 0-255 brightness scale back into LVGL's 0-100 scale
+  
+  # --- SINK BRIGHTNESS SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_kitchen_sink
+    attribute: brightness
+    id: ha_sink_brightness
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;' 
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: sink_bri_slider
+                value: !lambda 'return (x / 255.0) * 100.0;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
+
+  # --- DRYING RACK BRIGHTNESS SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_over_drying_rack
+    attribute: brightness
+    id: ha_rack_brightness
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;' 
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: rack_bri_slider
+                value: !lambda 'return (x / 255.0) * 100.0;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
+
+  # --- COFFEE MACHINE BRIGHTNESS SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_kitchen_coffee_machine
+    attribute: brightness
+    id: ha_coffee_brightness
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;' 
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: coffee_bri_slider
+                value: !lambda 'return (x / 255.0) * 100.0;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
+
+  # --- TV SHELVES BRIGHTNESS SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_shelves_above_tv
+    attribute: brightness
+    id: ha_tv_brightness
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;' 
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: tv_bri_slider
+                value: !lambda 'return (x / 255.0) * 100.0;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
+
+  # ==========================================
+  # COLOR TEMPERATURE SYNC SENSORS
+  # ==========================================
+  # Receives exact Kelvin values from HA and syncs them safely to the UI
+  
+  # --- SINK TEMPERATURE SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_kitchen_sink
+    attribute: color_temp_kelvin
+    id: ha_sink_temp
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;'
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: sink_temp_slider
+                value: !lambda 'return x;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
+
+  # --- DRYING RACK TEMPERATURE SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_over_drying_rack
+    attribute: color_temp_kelvin
+    id: ha_rack_temp
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;'
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: rack_temp_slider
+                value: !lambda 'return x;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
+
+  # --- COFFEE MACHINE TEMPERATURE SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_kitchen_coffee_machine
+    attribute: color_temp_kelvin
+    id: ha_coffee_temp
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;'
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: coffee_temp_slider
+                value: !lambda 'return x;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
+
+  # --- TV SHELVES TEMPERATURE SYNC ---
+  - platform: homeassistant
+    entity_id: light.led_strip_shelves_above_tv
+    attribute: color_temp_kelvin
+    id: ha_tv_temp
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !isnan(x) && x > 0;'
+          then:
+            - globals.set:           
+                id: ui_lock
+                value: 'true'
+            - lvgl.slider.update:
+                id: tv_temp_slider
+                value: !lambda 'return x;'
+            - globals.set:           
+                id: ui_lock
+                value: 'false'
